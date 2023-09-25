@@ -1,0 +1,11 @@
+name: MolT
+channels:
+  - conda-forge
+  - pytorch
+  - pyg
+  - nvidia
+dependencies:
+  - pytorch
+  - pytorch-cuda=11.8
+  - pyg
+  - networkx
