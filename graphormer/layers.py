@@ -40,95 +40,75 @@ class RadialBasisEmbedding(nn.Module):
         return rbf
 
 
-class SpatialEncoding(nn.Module):
-    def __init__(self, node_dim: int, num_radial: int, radial_min: float, radial_max: float):
+def calculate_batchwise_distances(self, pos: torch.Tensor, batch: torch.Tensor = None):
+    """
+    :param pos: node position matrix
+    :param batch: batch pointer that shows graph indexes in batch of graphs
+    :return: torch.Tensor, pairwise distance matrix
+    """
+    if batch is None:
+        batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+    
+    all_distances = torch.cdist(pos, pos)
+    
+    batch_mask = (batch[:, None] == batch[None, :])
+    dist_mat = all_distances * batch_mask.float()
+    
+    return dist_mat
+
+
+class SpatialBias(nn.Module):
+    def __init__(self, num_heads:int, num_radial:int):
         """
+        :param num_heads: number of attention heads
         :param num_radial: number of radial basis functions
         :param radial_min: minimum distance center
         :param radial_max: maximum distance center
         """
         super(NodeCentralityEncodingEmbedding, self).__init__()
-        self.radial_basis = RadialBasisEmbedding(num_radial, radial_min, radial_max)
 
-        if node_dim != num_radial:
-            self.projection = nn.Linear(num_radial, node_dim)
-        else:
-            self.projection = nn.Identity()
+        self.projection = nn.Linear(num_radial, num_heads)
 
-    def forward(self, pos: torch.Tensor, batch: torch.Tensor = None):
+
+    def forward(self, rb_embedding: torch.Tensor):
         """
-        :param pos: node position matrix
-        :param batch: batch pointer that shows graph indexes in batch of graphs
-        :return: torch.Tensor, spatial Encoding matrix, block diagonal matrix of radial basis functions
+        :param rb_embedding: radial basis functions
+        :return: torch.Tensor, spatial bias matrix
         """
-        pos = data.pos
-        if batch is None:
-            batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+        spatial_bias = self.projection(rb_embedding)
 
-        dist_mat = self.calculate_batchwise_distances(pos, batch)
-        spatial_encoding = self.radial_basis(dist_mat)
-        spatial_encoding = self.projection(spatial_encoding)
+        return spatial_bias.unsqueeze(-1) # [N, N, H, 1]
 
-        return spatial_encoding
-
-
-    def calculate_batchwise_distances(self, pos, batch):
-        """
-        :param pos: node position matrix
-        :param batch: batch pointer that shows graph indexes in batch of graphs
-        :return: torch.Tensor, pairwise distance matrix
-        """
-        all_distances = torch.cdist(pos, pos)
-        
-        batch_mask = (batch[:, None] == batch[None, :])
-        dist_mat = all_distances * batch_mask.float()
-        
-        return dist_mat
 
 class CentralityEncoding(nn.Module):
     def __init__(self):
         super(CentralityEncoding, self).__init__()
 
-    def forward(self, spatial_encoding: torch.Tensor):
+    def forward(self, rb_embedding: torch.Tensor):
         """
-        :param spatial_encoding: spatial Encoding matrix, block diagonal matrix of radial basis functions
+        :param rb_embedding: spatial Encoding matrix, block diagonal matrix of radial basis functions
         :return: torch.Tensor, centrality Encoding matrix, sum of radial basis functions
         """
-        centrality_encoding = torch.sum(spatial_encoding, dim=-2)
-        return centrality_encoding
+        centrality_encoding = torch.sum(rb_embedding, dim=-2)
+        return centrality_encoding # N, D
 
 
-def dot_product(x1, x2) -> torch.Tensor:
-    return (x1 * x2).sum(dim=1)
-
-
-class EdgeEncoding(nn.Module):
-    def __init__(self, edge_dim: int, max_path_distance: int):
+class EdgeBias(nn.Module):
+    def __init__(self, num_heads:int, edge_attr_dim: int):
         """
-        :param edge_dim: edge feature matrix number of dimension
+        :param emb_dim: embedding dimension
+        :param edge_attr_dim: edge feature matrix number of dimension
         """
         super().__init__()
-        self.edge_dim = edge_dim
-        self.max_path_distance = max_path_distance
-        self.edge_vector = nn.Parameter(torch.randn(self.max_path_distance, self.edge_dim))
+        self.projection = nn.Linear(edge_attr_dim, num_heads)
 
-    def forward(self, x: torch.Tensor, edge_attr: torch.Tensor, edge_paths) -> torch.Tensor:
+    def forward(self, edge_attr: torch.Tensor):
         """
-        :param x: node feature matrix
         :param edge_attr: edge feature matrix
-        :param edge_paths: pairwise node paths in edge indexes
-        :return: torch.Tensor, Edge Encoding matrix
+        :return: torch.Tensor, edge bias matrix
         """
-        cij = torch.zeros((x.shape[0], x.shape[0])).to(next(self.parameters()).device)
-
-        for src in edge_paths:
-            for dst in edge_paths[src]:
-                path_ij = edge_paths[src][dst][:self.max_path_distance]
-                weight_inds = [i for i in range(len(path_ij))]
-                cij[src][dst] = dot_product(self.edge_vector[weight_inds], edge_attr[path_ij]).mean()
-
-        cij = torch.nan_to_num(cij)
-        return cij
+        edge_bias = self.projection(edge_attr)
+        return edge_bias.unsqueeze(-1) # [N, N, H, 1]
 
 
 class GraphormerAttentionHead(nn.Module):
