@@ -9,3 +9,4 @@ dependencies:
   - pytorch-cuda=11.8
   - pyg
   - networkx
+  - ipykernel
