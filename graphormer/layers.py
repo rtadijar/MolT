@@ -6,59 +6,96 @@ from torch_geometric.utils import degree
 
 from graphormer.utils import decrease_to_max_value
 
-
-class CentralityEncoding(nn.Module):
-    def __init__(self, max_in_degree: int, max_out_degree: int, node_dim: int):
+class RadialBasisEmbedding(nn.Module):
+    def __init__(self, num_radial: int, radial_min: float, radial_max: float):
         """
-        :param max_in_degree: max in degree of nodes
-        :param max_out_degree: max in degree of nodes
-        :param node_dim: hidden dimensions of node features
+        :param num_radial: number of radial basis functions
+        :param radial_min: minimum distance center
+        :param radial_max: maximum distance center
         """
-        super().__init__()
-        self.max_in_degree = max_in_degree
-        self.max_out_degree = max_out_degree
-        self.node_dim = node_dim
-        self.z_in = nn.Parameter(torch.randn((max_in_degree, node_dim)))
-        self.z_out = nn.Parameter(torch.randn((max_out_degree, node_dim)))
+        super(RadialBasisEmbedding, self).__init__()
 
-    def forward(self, x: torch.Tensor, edge_index: torch.LongTensor) -> torch.Tensor:
+        self.num_radial = num_radial
+        self.radial_min = radial_min
+        self.radial_max = radial_max
+
+        centers = torch.linspace(radial_min, radial_max, num_radial).view(-1, 1)
+        widths = (centers[1] - centers[0]) * torch.ones_like(centers)
+
+        self.register_buffer("centers", centers)
+        self.register_buffer("widths", widths)
+
+    def forward(self, distance):
         """
-        :param x: node feature matrix
-        :param edge_index: edge_index of graph (adjacency list)
-        :return: torch.Tensor, node embeddings after Centrality encoding
+        :param distance: pairwise distance vector/matrix
+        :return: torch.Tensor, radial basis functions
         """
-        num_nodes = x.shape[0]
+        shape = distance.shape
+        distance = distance.view(-1, 1)
+        rbf = torch.exp(-((distance.squeeze() - self.centers) ** 2) / (2 * self.widths ** 2))
+        
+        rbf = rbf.transpose(-1, -2)
+        rbf = rbf.view(*shape, self.num_radial)
 
-        in_degree = decrease_to_max_value(degree(index=edge_index[1], num_nodes=num_nodes).long(), self.max_in_degree)
-        out_degree = decrease_to_max_value(degree(index=edge_index[0], num_nodes=num_nodes).long(), self.max_out_degree)
-
-        x += self.z_in[in_degree] + self.z_out[out_degree]
-
-        return x
+        return rbf
 
 
 class SpatialEncoding(nn.Module):
-    def __init__(self, max_path_distance: int):
+    def __init__(self, node_dim: int, num_radial: int, radial_min: float, radial_max: float):
         """
-        :param max_path_distance: max pairwise distance between nodes
+        :param num_radial: number of radial basis functions
+        :param radial_min: minimum distance center
+        :param radial_max: maximum distance center
         """
-        super().__init__()
-        self.max_path_distance = max_path_distance
+        super(NodeCentralityEncodingEmbedding, self).__init__()
+        self.radial_basis = RadialBasisEmbedding(num_radial, radial_min, radial_max)
 
-        self.b = nn.Parameter(torch.randn(self.max_path_distance))
+        if node_dim != num_radial:
+            self.projection = nn.Linear(num_radial, node_dim)
+        else:
+            self.projection = nn.Identity()
 
-    def forward(self, x: torch.Tensor, paths) -> torch.Tensor:
+    def forward(self, pos: torch.Tensor, batch: torch.Tensor = None):
         """
-        :param x: node feature matrix
-        :param paths: pairwise node paths
-        :return: torch.Tensor, spatial Encoding matrix
+        :param pos: node position matrix
+        :param batch: batch pointer that shows graph indexes in batch of graphs
+        :return: torch.Tensor, spatial Encoding matrix, block diagonal matrix of radial basis functions
         """
-        spatial_matrix = torch.zeros((x.shape[0], x.shape[0])).to(next(self.parameters()).device)
-        for src in paths:
-            for dst in paths[src]:
-                spatial_matrix[src][dst] = self.b[min(len(paths[src][dst]), self.max_path_distance) - 1]
+        pos = data.pos
+        if batch is None:
+            batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
 
-        return spatial_matrix
+        dist_mat = self.calculate_batchwise_distances(pos, batch)
+        spatial_encoding = self.radial_basis(dist_mat)
+        spatial_encoding = self.projection(spatial_encoding)
+
+        return spatial_encoding
+
+
+    def calculate_batchwise_distances(self, pos, batch):
+        """
+        :param pos: node position matrix
+        :param batch: batch pointer that shows graph indexes in batch of graphs
+        :return: torch.Tensor, pairwise distance matrix
+        """
+        all_distances = torch.cdist(pos, pos)
+        
+        batch_mask = (batch[:, None] == batch[None, :])
+        dist_mat = all_distances * batch_mask.float()
+        
+        return dist_mat
+
+class CentralityEncoding(nn.Module):
+    def __init__(self):
+        super(CentralityEncoding, self).__init__()
+
+    def forward(self, spatial_encoding: torch.Tensor):
+        """
+        :param spatial_encoding: spatial Encoding matrix, block diagonal matrix of radial basis functions
+        :return: torch.Tensor, centrality Encoding matrix, sum of radial basis functions
+        """
+        centrality_encoding = torch.sum(spatial_encoding, dim=-2)
+        return centrality_encoding
 
 
 def dot_product(x1, x2) -> torch.Tensor:
