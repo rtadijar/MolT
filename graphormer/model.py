@@ -4,94 +4,92 @@ import torch
 from torch import nn
 from torch_geometric.data import Data
 
-from graphormer.functional import shortest_path_distance, batched_shortest_path_distance
-from graphormer.layers import GraphormerEncoderLayer, CentralityEncoding, SpatialEncoding
+from graphormer.functional import calculate_batchwise_distances
+from graphormer.layers import GraphormerEncoderLayer, CentralityEncoding, RadialBasisEmbedding
 
 
 class Graphormer(nn.Module):
     def __init__(self,
                  num_layers: int,
-                 input_node_dim: int,
-                 node_dim: int,
-                 input_edge_dim: int,
-                 edge_dim: int,
+                 input_dim: int,
+                 emb_dim: int,
+                 input_edge_attr_dim: int,
+                 edge_attr_dim: int,
                  output_dim: int,
-                 n_heads: int,
-                 max_in_degree: int,
-                 max_out_degree: int,
-                 max_path_distance: int):
+                 num_radial: int,
+                 radial_min: float,
+                 radial_max: float,
+                 num_heads: int,
+                    ):
         """
         :param num_layers: number of Graphormer layers
-        :param input_node_dim: input dimension of node features
-        :param node_dim: hidden dimensions of node features
-        :param input_edge_dim: input dimension of edge features
-        :param edge_dim: hidden dimensions of edge features
+        :param input_dim: input dimension of node features
+        :param emb_dim: hidden dimensions of node features
+        :param input_edge_attr_dim: input dimension of edge features
+        :param edge_attr_dim: hidden dimensions of edge features
         :param output_dim: number of output node features
-        :param n_heads: number of attention heads
-        :param max_in_degree: max in degree of nodes
-        :param max_out_degree: max in degree of nodes
-        :param max_path_distance: max pairwise distance between two nodes
+        :param num_heads: number of attention heads
         """
         super().__init__()
 
         self.num_layers = num_layers
-        self.input_node_dim = input_node_dim
-        self.node_dim = node_dim
-        self.input_edge_dim = input_edge_dim
-        self.edge_dim = edge_dim
+        self.input_dim = input_dim
+        self.emb_dim = emb_dim
+        self.input_edge_attr_dim = input_edge_attr_dim
+        self.edge_attr_dim = edge_attr_dim
         self.output_dim = output_dim
-        self.n_heads = n_heads
-        self.max_in_degree = max_in_degree
-        self.max_out_degree = max_out_degree
-        self.max_path_distance = max_path_distance
+        self.num_heads = num_heads
 
-        self.node_in_lin = nn.Linear(self.input_node_dim, self.node_dim)
-        self.edge_in_lin = nn.Linear(self.input_edge_dim, self.edge_dim)
+        self.num_radial = num_radial
+        self.radial_min = radial_min
+        self.radial_max = radial_max
 
-        self.centrality_encoding = CentralityEncoding(
-            max_in_degree=self.max_in_degree,
-            max_out_degree=self.max_out_degree,
-            node_dim=self.node_dim
-        )
+        self.node_in_lin = nn.Linear(self.input_dim, self.emb_dim)
+        self.edge_in_lin = nn.Linear(self.input_edge_attr_dim, self.edge_attr_dim)
 
-        self.spatial_encoding = SpatialEncoding(
-            max_path_distance=max_path_distance,
-        )
+        self.radial_basis = RadialBasisEmbedding(num_radial=self.num_radial, radial_min=self.radial_min, radial_max=self.radial_max)
+        self.centrality_encoding = CentralityEncoding(num_radial=self.num_radial, emb_dim=self.emb_dim)
 
         self.layers = nn.ModuleList([
             GraphormerEncoderLayer(
-                node_dim=self.node_dim,
-                edge_dim=self.edge_dim,
-                n_heads=self.n_heads,
-                max_path_distance=self.max_path_distance) for _ in range(self.num_layers)
+                emb_dim=self.emb_dim,
+                num_heads=self.num_heads,
+                num_radial=self.num_radial,
+                edge_attr_dim=self.edge_attr_dim
+            ) 
+            for _ in range(self.num_layers)
         ])
 
-        self.node_out_lin = nn.Linear(self.node_dim, self.output_dim)
+        self.node_out_lin = nn.Linear(self.emb_dim, self.output_dim)
 
     def forward(self, data: Union[Data]) -> torch.Tensor:
         """
-        :param data: input graph of batch of graphs
+        :param data: input graph or batch of graphs
         :return: torch.Tensor, output node embeddings
         """
         x = data.x.float()
-        edge_index = data.edge_index.long()
         edge_attr = data.edge_attr.float()
 
-        if type(data) == Data:
+        if 'batch' not in data:
             ptr = None
-            node_paths, edge_paths = shortest_path_distance(data)
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         else:
             ptr = data.ptr
-            node_paths, edge_paths = batched_shortest_path_distance(data)
+            batch = data.batch
+
+        pos = data.pos
 
         x = self.node_in_lin(x)
         edge_attr = self.edge_in_lin(edge_attr)
 
-        x = self.centrality_encoding(x, edge_index)
-        b = self.spatial_encoding(x, node_paths)
+        dist_matrix = calculate_batchwise_distances(pos, batch)
+        rb_embedding = self.radial_basis(dist_matrix)
+
+        centrality_encoding = self.centrality_encoding(rb_embedding)
+        x += centrality_encoding
 
         for layer in self.layers:
-            x = layer(x, edge_attr, b, edge_paths, ptr)
+            x = layer(x, rb_embedding, edge_attr, ptr)
 
         x = self.node_out_lin(x)
 

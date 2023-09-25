@@ -40,23 +40,6 @@ class RadialBasisEmbedding(nn.Module):
         return rbf
 
 
-def calculate_batchwise_distances(self, pos: torch.Tensor, batch: torch.Tensor = None):
-    """
-    :param pos: node position matrix
-    :param batch: batch pointer that shows graph indexes in batch of graphs
-    :return: torch.Tensor, pairwise distance matrix
-    """
-    if batch is None:
-        batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
-    
-    all_distances = torch.cdist(pos, pos)
-    
-    batch_mask = (batch[:, None] == batch[None, :])
-    dist_mat = all_distances * batch_mask.float()
-    
-    return dist_mat
-
-
 class SpatialBias(nn.Module):
     def __init__(self, num_heads:int, num_radial:int):
         """
@@ -81,15 +64,19 @@ class SpatialBias(nn.Module):
 
 
 class CentralityEncoding(nn.Module):
-    def __init__(self):
+    def __init__(self, num_radial: int, emb_dim: int):
         super(CentralityEncoding, self).__init__()
+
+        self.projection = nn.Linear(num_radial, emb_dim)
 
     def forward(self, rb_embedding: torch.Tensor):
         """
         :param rb_embedding: spatial Encoding matrix, block diagonal matrix of radial basis functions
         :return: torch.Tensor, centrality Encoding matrix, sum of radial basis functions
         """
-        centrality_encoding = torch.sum(rb_embedding, dim=-2)
+        centrality_encoding = self.projection(rb_embedding)
+        centrality_encoding = torch.sum(centrality_encoding, dim=-2)
+        
         return centrality_encoding # N, D
 
 
