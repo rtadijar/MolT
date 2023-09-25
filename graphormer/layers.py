@@ -65,7 +65,7 @@ class SpatialBias(nn.Module):
         :param radial_min: minimum distance center
         :param radial_max: maximum distance center
         """
-        super(NodeCentralityEncodingEmbedding, self).__init__()
+        super(SpatialBias, self).__init__()
 
         self.projection = nn.Linear(num_radial, num_heads)
 
@@ -77,7 +77,7 @@ class SpatialBias(nn.Module):
         """
         spatial_bias = self.projection(rb_embedding)
 
-        return spatial_bias.unsqueeze(-1) # [N, N, H, 1]
+        return spatial_bias.permute(2, 0, 1)
 
 
 class CentralityEncoding(nn.Module):
@@ -108,146 +108,109 @@ class EdgeBias(nn.Module):
         :return: torch.Tensor, edge bias matrix
         """
         edge_bias = self.projection(edge_attr)
-        return edge_bias.unsqueeze(-1) # [N, N, H, 1]
+        return edge_bias.permute(2, 0, 1) # [H, N, N]
 
 
-class GraphormerAttentionHead(nn.Module):
-    def __init__(self, dim_in: int, dim_q: int, dim_k: int, edge_dim: int, max_path_distance: int):
+class GraphormerMHA(nn.Module):
+    def __init__(self, emb_dim: int, num_heads: int, num_radial: int, edge_attr_dim: int):
         """
-        :param dim_in: node feature matrix input number of dimension
-        :param dim_q: query node feature matrix input number dimension
-        :param dim_k: key node feature matrix input number of dimension
-        :param edge_dim: edge feature matrix number of dimension
+        :param emb_dim: embedding dimension
+        :param num_heads: number of attention heads
+        :param num_radial: number of radial basis functions for spatial bias
+        :param edge_attr_dim: edge attribute dimension
         """
         super().__init__()
-        self.edge_encoding = EdgeEncoding(edge_dim, max_path_distance)
+        self.spatial_bias = SpatialBias(num_heads, num_radial)
+        self.edge_bias = EdgeBias(num_heads, edge_attr_dim)
 
-        self.q = nn.Linear(dim_in, dim_q)
-        self.k = nn.Linear(dim_in, dim_k)
-        self.v = nn.Linear(dim_in, dim_k)
+        self.q = nn.Linear(emb_dim, emb_dim)
+        self.k = nn.Linear(emb_dim, emb_dim)
+        self.v = nn.Linear(emb_dim, emb_dim)
+
+        self.num_heads = num_heads
+        self.emb_dim = emb_dim
+        self.per_head_dim = emb_dim // num_heads
 
     def forward(self,
                 query: torch.Tensor,
                 key: torch.Tensor,
                 value: torch.Tensor,
+                rb_embedding: torch.Tensor,
                 edge_attr: torch.Tensor,
-                b: torch.Tensor,
-                edge_paths,
                 ptr) -> torch.Tensor:
         """
         :param query: node feature matrix
         :param key: node feature matrix
         :param value: node feature matrix
+        :param rb_embedding: spatial Encoding matrix, block diagonal matrix of radial basis functions
         :param edge_attr: edge feature matrix
-        :param b: spatial Encoding matrix
-        :param edge_paths: pairwise node paths in edge indexes
         :param ptr: batch pointer that shows graph indexes in batch of graphs
         :return: torch.Tensor, node embeddings after attention operation
         """
-        batch_mask_neg_inf = torch.full(size=(query.shape[0], query.shape[0]), fill_value=-1e6).to(next(self.parameters()).device)
-        batch_mask_zeros = torch.zeros(size=(query.shape[0], query.shape[0])).to(next(self.parameters()).device)
+        block_sizes = ptr[1:] - ptr[:-1]
+        blocks = [torch.ones((size, size)) for size in block_sizes]
+        block_diag_matrix = torch.block_diag(*blocks)
 
-        # OPTIMIZE: get rid of slices: rewrite to torch
-        if type(ptr) == type(None):
-            batch_mask_neg_inf = torch.ones(size=(query.shape[0], query.shape[0])).to(next(self.parameters()).device)
-            batch_mask_zeros += 1
-        else:
-            for i in range(len(ptr) - 1):
-                batch_mask_neg_inf[ptr[i]:ptr[i + 1], ptr[i]:ptr[i + 1]] = 1
-                batch_mask_zeros[ptr[i]:ptr[i + 1], ptr[i]:ptr[i + 1]] = 1
+        batch_mask_zeros = block_diag_matrix.clone().unsqueeze(0)
 
-        query = self.q(query)
-        key = self.k(key)
-        value = self.v(value)
+        batch_mask_neg_inf = block_diag_matrix.clone()
+        batch_mask_neg_inf[batch_mask_neg_inf == 0] = -1e6
+        batch_mask_neg_inf = batch_mask_neg_inf.unsqueeze(0)
 
-        c = self.edge_encoding(query, edge_attr, edge_paths)
-        a = query.mm(key.transpose(0, 1)) / query.size(-1) ** 0.5
-        a = (a + b + c) * batch_mask_neg_inf
-        softmax = torch.softmax(a, dim=-1) * batch_mask_zeros
-        x = softmax.mm(value)
+        query = self.q(query).reshape(-1, self.num_heads, self.per_head_dim) # [N, H, D // H]
+        key = self.k(key).reshape(-1, self.num_heads, self.per_head_dim) # [N, H, D // H]
+        value = self.v(value).reshape(-1, self.num_heads, self.per_head_dim) # [N, H, D // h]
+
+        edge_bias = self.edge_bias(edge_attr)
+        spatial_bias = self.spatial_bias(rb_embedding) 
+
+        qk = query.permute(1, 0, 2).bmm(key.permute(1, 2,0)) / query.size(-1) ** 0.5 # [H, N, N]
+        qk = (qk + edge_bias + spatial_bias) * batch_mask_neg_inf
+
+        softmax = torch.softmax(qk, dim=-1) * batch_mask_zeros # [H, N, N]
+        x = softmax.bmm(value.permute(1, 0, 2)) # [H, N, D]
+        x = x.permute(1, 0, 2).reshape(-1, self.emb_dim) # [N, H, D // H] -> [N, D]
+
         return x
 
-
-# FIX: sparse attention instead of regular attention, due to specificity of GNNs(all nodes in batch will exchange attention)
-class GraphormerMultiHeadAttention(nn.Module):
-    def __init__(self, num_heads: int, dim_in: int, dim_q: int, dim_k: int, edge_dim: int, max_path_distance: int):
+class GraphormerEncoderLayer(nn.Module):
+    def __init__(self, emb_dim, num_heads, num_radial, edge_attr_dim):
         """
+        :param emb_dim: embedding dimension
         :param num_heads: number of attention heads
-        :param dim_in: node feature matrix input number of dimension
-        :param dim_q: query node feature matrix input number dimension
-        :param dim_k: key node feature matrix input number of dimension
-        :param edge_dim: edge feature matrix number of dimension
+        :param num_radial: number of radial basis functions for spatial bias
+        :param edge_attr_dim: edge attribute dimension
         """
         super().__init__()
-        self.heads = nn.ModuleList(
-            [GraphormerAttentionHead(dim_in, dim_q, dim_k, edge_dim, max_path_distance) for _ in range(num_heads)]
+
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.num_radial = num_radial
+        self.edge_attr_dim = edge_attr_dim
+
+        self.attention = GraphormerMHA(
+            emb_dim=emb_dim,
+            num_heads=num_heads,
+            num_radial=num_radial,
+            edge_attr_dim=edge_attr_dim
         )
-        self.linear = nn.Linear(num_heads * dim_k, dim_in)
+        self.ln_1 = nn.LayerNorm(emb_dim)
+        self.ln_2 = nn.LayerNorm(emb_dim)
+        self.ff = nn.Linear(emb_dim, emb_dim)
 
     def forward(self,
                 x: torch.Tensor,
+                rb_embedding: torch.Tensor,
                 edge_attr: torch.Tensor,
-                b: torch.Tensor,
-                edge_paths,
                 ptr) -> torch.Tensor:
         """
         :param x: node feature matrix
+        :param rb_embedding: radial basis embedding
         :param edge_attr: edge feature matrix
-        :param b: spatial Encoding matrix
-        :param edge_paths: pairwise node paths in edge indexes
-        :param ptr: batch pointer that shows graph indexes in batch of graphs
-        :return: torch.Tensor, node embeddings after all attention heads
-        """
-        return self.linear(
-            torch.cat([
-                attention_head(x, x, x, edge_attr, b, edge_paths, ptr) for attention_head in self.heads
-            ], dim=-1)
-        )
-
-
-class GraphormerEncoderLayer(nn.Module):
-    def __init__(self, node_dim, edge_dim, n_heads, max_path_distance):
-        """
-        :param node_dim: node feature matrix input number of dimension
-        :param edge_dim: edge feature matrix input number of dimension
-        :param n_heads: number of attention heads
-        """
-        super().__init__()
-
-        self.node_dim = node_dim
-        self.edge_dim = edge_dim
-        self.n_heads = n_heads
-
-        self.attention = GraphormerMultiHeadAttention(
-            dim_in=node_dim,
-            dim_k=node_dim,
-            dim_q=node_dim,
-            num_heads=n_heads,
-            edge_dim=edge_dim,
-            max_path_distance=max_path_distance,
-        )
-        self.ln_1 = nn.LayerNorm(node_dim)
-        self.ln_2 = nn.LayerNorm(node_dim)
-        self.ff = nn.Linear(node_dim, node_dim)
-
-    def forward(self,
-                x: torch.Tensor,
-                edge_attr: torch.Tensor,
-                b: torch,
-                edge_paths,
-                ptr) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        h′(l) = MHA(LN(h(l−1))) + h(l−1)
-        h(l) = FFN(LN(h′(l))) + h′(l)
-
-        :param x: node feature matrix
-        :param edge_attr: edge feature matrix
-        :param b: spatial Encoding matrix
-        :param edge_paths: pairwise node paths in edge indexes
         :param ptr: batch pointer that shows graph indexes in batch of graphs
         :return: torch.Tensor, node embeddings after Graphormer layer operations
         """
-        x_prime = self.attention(self.ln_1(x), edge_attr, b, edge_paths, ptr) + x
+        x_prime = self.attention(self.ln_1(x), x, x, rb_embedding, edge_attr, ptr) + x
         x_new = self.ff(self.ln_2(x_prime)) + x_prime
 
         return x_new
