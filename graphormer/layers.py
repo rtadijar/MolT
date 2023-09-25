@@ -138,9 +138,9 @@ class GraphormerMHA(nn.Module):
         blocks = [torch.ones((size, size)) for size in block_sizes]
         block_diag_matrix = torch.block_diag(*blocks)
 
-        batch_mask_zeros = block_diag_matrix.clone().unsqueeze(0)
+        batch_mask_zeros = block_diag_matrix.clone().unsqueeze(0).to(query.device)
 
-        batch_mask_neg_inf = block_diag_matrix.clone()
+        batch_mask_neg_inf = block_diag_matrix.clone().to(query.device)
         batch_mask_neg_inf[batch_mask_neg_inf == 0] = -1e6
         batch_mask_neg_inf = batch_mask_neg_inf.unsqueeze(0)
 
